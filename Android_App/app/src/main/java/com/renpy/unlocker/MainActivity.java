@@ -1,15 +1,19 @@
 package com.renpy.unlocker;
 
 import android.content.SharedPreferences;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.provider.OpenableColumns;
+import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.AutoCompleteTextView;
 import android.widget.Button;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -20,6 +24,7 @@ import androidx.documentfile.provider.DocumentFile;
 
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.google.android.material.materialswitch.MaterialSwitch;
+import com.google.android.material.progressindicator.LinearProgressIndicator;
 import com.google.android.material.textfield.TextInputEditText;
 
 import org.json.JSONArray;
@@ -83,8 +88,12 @@ public class MainActivity extends AppCompatActivity {
         UNREADABLE
     }
 
+    private ScrollView svRoot;
+    private View llExportProgress;
     private TextView tvFolderStatus;
     private TextView tvUnlockVerdict;
+    private TextView tvExportStage;
+    private LinearProgressIndicator pbExport;
     private TextView tvLog;
     private MaterialSwitch cbGallery, cbFixFont, cbSeenImage, cbConsole, cbSkip;
     private Button btnInject, btnExport, btnRestore, btnAiAnalyze;
@@ -92,6 +101,9 @@ public class MainActivity extends AppCompatActivity {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     private DocumentFile gameDir;
+    private Uri selectedApkUri;
+    private String selectedApkName = "game";
+    private boolean apkUsesXPrefix = false;
     private ScanResult lastScan;
     private String aiExtraCode = "";
 
@@ -136,10 +148,24 @@ public class MainActivity extends AppCompatActivity {
                 }
             });
 
+    private final ActivityResultLauncher<String[]> pickApkLauncher =
+            registerForActivityResult(new ActivityResultContracts.OpenDocument(), uri -> {
+                if (uri != null) {
+                    onApkPicked(uri);
+                }
+            });
+
     private final ActivityResultLauncher<String> exportFileLauncher =
             registerForActivityResult(new ActivityResultContracts.CreateDocument("application/octet-stream"), uri -> {
                 if (uri != null) {
                     writePatchToUri(uri);
+                }
+            });
+
+    private final ActivityResultLauncher<String> exportApkLauncher =
+            registerForActivityResult(new ActivityResultContracts.CreateDocument("application/vnd.android.package-archive"), uri -> {
+                if (uri != null) {
+                    performExportPatchedApk(uri);
                 }
             });
 
@@ -148,8 +174,12 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        svRoot = findViewById(R.id.svRoot);
+        llExportProgress = findViewById(R.id.llExportProgress);
         tvFolderStatus = findViewById(R.id.tvFolderStatus);
         tvUnlockVerdict = findViewById(R.id.tvUnlockVerdict);
+        tvExportStage = findViewById(R.id.tvExportStage);
+        pbExport = findViewById(R.id.pbExport);
         tvLog = findViewById(R.id.tvLog);
         cbGallery = findViewById(R.id.cbGallery);
         cbFixFont = findViewById(R.id.cbFixFont);
@@ -158,6 +188,7 @@ public class MainActivity extends AppCompatActivity {
         cbSkip = findViewById(R.id.cbSkip);
 
         Button btnPickFolder = findViewById(R.id.btnPickFolder);
+        Button btnPickApk = findViewById(R.id.btnPickApk);
         Button btnAiConfig = findViewById(R.id.btnAiConfig);
         btnAiAnalyze = findViewById(R.id.btnAiAnalyze);
         btnInject = findViewById(R.id.btnInject);
@@ -165,6 +196,11 @@ public class MainActivity extends AppCompatActivity {
         btnRestore = findViewById(R.id.btnRestore);
 
         btnPickFolder.setOnClickListener(v -> pickFolderLauncher.launch(null));
+        btnPickApk.setOnClickListener(v -> pickApkLauncher.launch(new String[]{
+                "application/vnd.android.package-archive",
+                "application/octet-stream",
+                "*/*"
+        }));
         btnAiConfig.setOnClickListener(v -> showAiConfigDialog());
         btnAiAnalyze.setOnClickListener(v -> runAiAnalysis());
         btnInject.setOnClickListener(v -> injectPatchIntoGame());
@@ -179,9 +215,11 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        selectedApkUri = null;
         tvLog.setText("Đang tìm thư mục game/ và quét dữ liệu...\n");
         tvUnlockVerdict.setVisibility(View.GONE);
         aiExtraCode = "";
+        btnInject.setText("Chép thẳng vào thư mục game");
         btnInject.setEnabled(false);
         btnExport.setEnabled(false);
         btnRestore.setEnabled(false);
@@ -207,59 +245,152 @@ public class MainActivity extends AppCompatActivity {
                 gameDir = foundGame;
                 lastScan = res;
                 tvFolderStatus.setText("Đã nhận diện: " + picked.getName() + "/game");
-                applyVerdictBanner(res);
-
-                appendLog("[OK] Tìm thấy thư mục game/");
-                appendLog("• File .rpa: " + res.rpaCount + " | .rpy: " + res.rpyCount + " | .rpyc: " + res.rpycCount);
-                if (!res.vars.isEmpty()) {
-                    appendLog("• Biến unlock (.rpy): " + String.join(", ", res.vars));
-                }
-                if (!res.rpycPersistentHints.isEmpty()) {
-                    appendLog("• Biến nghi ngờ (.rpyc/ref): " + String.join(", ", res.rpycPersistentHints));
-                }
-                if (!res.unlockFuncs.isEmpty()) {
-                    appendLog("• Hàm kiểm tra unlock: " + String.join(", ", res.unlockFuncs));
-                }
-                if (res.vars.isEmpty() && res.rpycPersistentHints.isEmpty() && res.unlockFuncs.isEmpty()) {
-                    appendLog("• Không thấy tên biến persistent.*gallery/unlock cụ thể.");
-                }
-                if (res.usesSeenImage || res.usesSeenLabel) {
-                    String seenInfo = (res.usesSeenImage ? "seen_image() " : "")
-                            + (res.usesSeenLabel ? "seen_label()" : "");
-                    appendLog("• Game có dùng: " + seenInfo.trim() + " -> Tự động bật Universal Bypass.");
-                    cbSeenImage.setChecked(true);
-                }
-                if (res.usesGalleryClass) {
-                    appendLog("• Phát hiện hệ thống Ren'Py Gallery().");
-                }
-                if (res.hasGalleryScreen) {
-                    appendLog("• Phát hiện màn hình Gallery / Replay.");
-                }
-                if (res.hasCustomUnlockFunc) {
-                    appendLog("• Phát hiện hàm/cấu trúc unlock tùy chỉnh.");
-                }
-                if (res.hasVietnamese && !res.suspectFonts.isEmpty()) {
-                    appendLog("[FONT] Phát hiện bản Việt hóa dùng font dễ thiếu dấu: "
-                            + String.join(", ", res.suspectFonts));
-                    appendLog("-> Tự động bật 'Sửa lỗi Font tiếng Việt (DejaVuSans)'.");
-                    cbFixFont.setChecked(true);
-                } else if (res.hasVietnamese) {
-                    appendLog("• Phát hiện bản Việt hóa.");
-                }
-                appendLog("────────────────────────");
-                appendLog("[ĐÁNH GIÁ] " + res.verdictTitle);
-                appendLog("→ " + res.verdictReason);
-                appendLog(res.patchExists
-                        ? "• Trạng thái mod: ĐÃ CÀI MOD (" + PATCH_FILENAME + ")"
-                        : "• Trạng thái mod: Chưa cài mod");
-
-                boolean hasScripts = (res.rpyCount + res.rpycCount) > 0;
-                btnInject.setEnabled(true);
-                btnExport.setEnabled(true);
-                btnAiAnalyze.setEnabled(hasScripts && (res.priorityAiContext.length() > 0 || res.aiContext.length() > 0));
-                btnRestore.setEnabled(res.patchExists);
+                renderScanResult(res, false);
             });
         });
+    }
+
+    private void onApkPicked(Uri apkUri) {
+        String displayName = queryDisplayName(apkUri);
+        if (displayName == null || displayName.isEmpty()) {
+            displayName = "game.apk";
+        }
+        String finalName = displayName;
+        gameDir = null;
+        selectedApkUri = apkUri;
+        selectedApkName = finalName.replaceAll("(?i)\\.apk$", "");
+        apkUsesXPrefix = false;
+
+        tvFolderStatus.setText("Đã chọn APK: " + finalName);
+        tvLog.setText("Đang quét assets/ bên trong " + finalName + "...\n");
+        tvUnlockVerdict.setVisibility(View.GONE);
+        aiExtraCode = "";
+        btnInject.setText("Xuất APK đã Mod (đã ký)");
+        btnInject.setEnabled(false);
+        btnExport.setEnabled(false);
+        btnRestore.setEnabled(false);
+        btnAiAnalyze.setEnabled(false);
+
+        executor.execute(() -> {
+            try {
+                ScanResult res = new ScanResult();
+                Set<String> seenVars = new LinkedHashSet<>();
+                ApkPatcher.ApkScanInfo info = ApkPatcher.scanApk(
+                        getContentResolver(),
+                        apkUri,
+                        getCacheDir(),
+                        new ApkPatcher.ScriptCallback() {
+                            @Override
+                            public void onScript(String logicalName, String text, boolean isRpyc) {
+                                scanText(logicalName, text, isRpyc, res, seenVars);
+                            }
+
+                            @Override
+                            public void onWarning(String msg) {
+                                runOnUiThread(() -> appendLog("[CẢNH BÁO] " + msg));
+                            }
+                        }
+                );
+                res.rpaCount = info.rpaCount;
+                res.rpyCount = info.rpyCount;
+                res.rpycCount = info.rpycCount;
+                res.hasVietnamese = res.hasVietnamese || info.hasVietnamese;
+                res.patchExists = info.patchExists;
+                res.vars.addAll(seenVars);
+                res.rpycPersistentHints.removeAll(seenVars);
+                evaluateVerdict(res);
+
+                runOnUiThread(() -> {
+                    if (!info.foundGameAssets) {
+                        selectedApkUri = null;
+                        lastScan = null;
+                        tvUnlockVerdict.setVisibility(View.VISIBLE);
+                        tvUnlockVerdict.setText("KHÔNG PHẢI GAME REN'PY: Không thấy assets/game hoặc assets/x-game");
+                        tvUnlockVerdict.setTextColor(Color.parseColor("#F87171"));
+                        appendLog("[LỖI] Không tìm thấy dữ liệu Ren'Py (assets/x-game/ hoặc assets/game/) trong APK.");
+                        return;
+                    }
+                    apkUsesXPrefix = info.usesXPrefix;
+                    lastScan = res;
+                    appendLog("[OK] Đã đọc APK (" + (info.usesXPrefix ? "assets/x-game/" : "assets/game/") + ")");
+                    renderScanResult(res, true);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    selectedApkUri = null;
+                    lastScan = null;
+                    tvUnlockVerdict.setVisibility(View.VISIBLE);
+                    tvUnlockVerdict.setText("LỖI ĐỌC APK");
+                    tvUnlockVerdict.setTextColor(Color.parseColor("#F87171"));
+                    appendLog("[LỖI] Không đọc được APK: " + e.getMessage());
+                });
+            }
+        });
+    }
+
+    private void renderScanResult(ScanResult res, boolean isApkMode) {
+        applyVerdictBanner(res);
+        if (!isApkMode) {
+            appendLog("[OK] Tìm thấy thư mục game/");
+        }
+        appendLog("• File .rpa: " + res.rpaCount + " | .rpy: " + res.rpyCount + " | .rpyc: " + res.rpycCount);
+        if (!res.vars.isEmpty()) {
+            appendLog("• Biến unlock (.rpy): " + String.join(", ", res.vars));
+        }
+        if (!res.rpycPersistentHints.isEmpty()) {
+            appendLog("• Biến nghi ngờ (.rpyc/ref): " + String.join(", ", res.rpycPersistentHints));
+        }
+        if (!res.unlockFuncs.isEmpty()) {
+            appendLog("• Hàm kiểm tra unlock: " + String.join(", ", res.unlockFuncs));
+        }
+        if (res.vars.isEmpty() && res.rpycPersistentHints.isEmpty() && res.unlockFuncs.isEmpty()) {
+            appendLog("• Không thấy tên biến persistent.*gallery/unlock cụ thể.");
+        }
+        if (res.usesSeenImage || res.usesSeenLabel) {
+            String seenInfo = (res.usesSeenImage ? "seen_image() " : "")
+                    + (res.usesSeenLabel ? "seen_label()" : "");
+            appendLog("• Game có dùng: " + seenInfo.trim() + " -> Tự động bật Universal Bypass.");
+            cbSeenImage.setChecked(true);
+        }
+        if (res.usesGalleryClass) {
+            appendLog("• Phát hiện hệ thống Ren'Py Gallery().");
+        }
+        if (res.hasGalleryScreen) {
+            appendLog("• Phát hiện màn hình Gallery / Replay.");
+        }
+        if (res.hasCustomUnlockFunc) {
+            appendLog("• Phát hiện hàm/cấu trúc unlock tùy chỉnh.");
+        }
+        if (res.hasVietnamese && !res.suspectFonts.isEmpty()) {
+            appendLog("[FONT] Phát hiện bản Việt hóa dùng font dễ thiếu dấu: "
+                    + String.join(", ", res.suspectFonts));
+            appendLog("-> Tự động bật 'Sửa lỗi Font tiếng Việt (DejaVuSans)'.");
+            cbFixFont.setChecked(true);
+        } else if (res.hasVietnamese) {
+            appendLog("• Phát hiện bản Việt hóa.");
+        }
+        appendLog("────────────────────────");
+        appendLog("[ĐÁNH GIÁ] " + res.verdictTitle);
+        appendLog("→ " + res.verdictReason);
+        appendLog(res.patchExists
+                ? "• Trạng thái mod: ĐÃ CÀI MOD (" + PATCH_FILENAME + ")"
+                : "• Trạng thái mod: Chưa cài mod");
+
+        boolean hasScripts = (res.rpyCount + res.rpycCount) > 0;
+        btnInject.setEnabled(true);
+        btnExport.setEnabled(true);
+        btnAiAnalyze.setEnabled(hasScripts && (res.priorityAiContext.length() > 0 || res.aiContext.length() > 0));
+        btnRestore.setEnabled(!isApkMode && res.patchExists);
+    }
+
+    private String queryDisplayName(Uri uri) {
+        try (Cursor c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                return c.getString(0);
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private DocumentFile findGameDir(DocumentFile picked) {
@@ -898,7 +1029,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void injectPatchIntoGame() {
-        if (gameDir == null) return;
+        if (gameDir == null && selectedApkUri == null) return;
         if (lastScan != null
                 && (lastScan.verdict == UnlockVerdict.LOW || lastScan.verdict == UnlockVerdict.UNREADABLE)
                 && cbGallery.isChecked()
@@ -906,13 +1037,75 @@ public class MainActivity extends AppCompatActivity {
             new MaterialAlertDialogBuilder(this)
                     .setTitle("Cảnh báo khả năng Unlock")
                     .setMessage(lastScan.verdictTitle + "\n\n" + lastScan.verdictReason
-                            + "\n\nBạn vẫn muốn chép file mod vào game?")
-                    .setPositiveButton("Vẫn chép", (d, w) -> performInjectPatch())
+                            + "\n\nBạn vẫn muốn tiếp tục áp dụng mod?")
+                    .setPositiveButton("Vẫn tiếp tục", (d, w) -> proceedInjectOrExportApk())
                     .setNegativeButton("Hủy", null)
                     .show();
             return;
         }
-        performInjectPatch();
+        proceedInjectOrExportApk();
+    }
+
+    private void proceedInjectOrExportApk() {
+        if (selectedApkUri != null) {
+            exportApkLauncher.launch(selectedApkName + "_unlocked.apk");
+        } else {
+            performInjectPatch();
+        }
+    }
+
+    private void performExportPatchedApk(Uri destApkUri) {
+        if (selectedApkUri == null) return;
+        String code = generatePatchCode();
+        llExportProgress.setVisibility(View.VISIBLE);
+        pbExport.setProgressCompat(0, false);
+        tvExportStage.setText("Đang chuẩn bị xuất APK...");
+        tvExportStage.setTextColor(Color.parseColor("#34D399"));
+        appendLog("\n[APK] Bắt đầu chèn mod và ký lại APK...");
+        btnInject.setEnabled(false);
+
+        executor.execute(() -> {
+            try {
+                ApkPatcher.patchAndSignApk(
+                        this,
+                        selectedApkUri,
+                        destApkUri,
+                        code,
+                        apkUsesXPrefix,
+                        new ApkPatcher.PatchProgressCallback() {
+                            @Override
+                            public void onProgress(int percent, String stage) {
+                                runOnUiThread(() -> {
+                                    pbExport.setProgressCompat(percent, true);
+                                    tvExportStage.setText(stage);
+                                });
+                            }
+
+                            @Override
+                            public void onLog(String line) {
+                                runOnUiThread(() -> appendLog(line));
+                            }
+                        }
+                );
+                runOnUiThread(() -> {
+                    btnInject.setEnabled(true);
+                    pbExport.setProgressCompat(100, true);
+                    tvExportStage.setText("Hoàn tất xuất APK: " + selectedApkName + "_unlocked.apk");
+                    appendLog("[THÀNH CÔNG] Đã xuất APK mod đã ký: " + selectedApkName + "_unlocked.apk");
+                    appendLog("Lưu ý: Gỡ bản APK gốc (nếu đã cài) rồi cài file APK mod mới này.");
+                    Toast.makeText(this, "Xuất APK mod thành công!", Toast.LENGTH_LONG).show();
+                });
+            } catch (Throwable t) {
+                Log.e("RenPyUnlocker", "patchAndSignApk failed", t);
+                runOnUiThread(() -> {
+                    btnInject.setEnabled(true);
+                    tvExportStage.setText("Lỗi xuất APK!");
+                    tvExportStage.setTextColor(Color.parseColor("#F87171"));
+                    appendLog("[LỖI APK] " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    Toast.makeText(this, "Lỗi patch APK: " + t.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        });
     }
 
     private void performInjectPatch() {
@@ -992,6 +1185,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void appendLog(String msg) {
         tvLog.append(msg + "\n");
+        if (svRoot != null) {
+            svRoot.post(() -> svRoot.fullScroll(View.FOCUS_DOWN));
+        }
     }
 
     @Override
