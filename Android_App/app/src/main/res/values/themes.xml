@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.RenPyUnlocker" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">#10B981</item>
+        <item name="colorOnPrimary">#052E22</item>
+        <item name="colorSecondary">#8B5CF6</item>
+        <item name="android:windowBackground">#0F111A</item>
+        <item name="android:statusBarColor">#0F111A</item>
+        <item name="android:navigationBarColor">#0F111A</item>
+    </style>
+</resources>
